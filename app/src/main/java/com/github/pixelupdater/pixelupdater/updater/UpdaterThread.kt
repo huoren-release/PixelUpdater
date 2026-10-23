@@ -1,0 +1,2102 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Pixel Updater contributors
+ * SPDX-FileCopyrightText: 2023 Andrew Gunnerson
+ * SPDX-FileContributor: Modified by Pixel Updater contributors
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+package com.github.pixelupdater.pixelupdater.updater
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.net.Network
+import android.net.Uri
+import android.os.Build
+import android.os.IUpdateEngine
+import android.os.IUpdateEngineCallback
+import android.os.Parcelable
+import android.os.PowerManager
+import android.os.ParcelFileDescriptor
+import android.ota.OtaPackageMetadata.OtaMetadata
+import android.util.Log
+import com.github.pixelupdater.pixelupdater.BuildConfig
+import com.github.pixelupdater.pixelupdater.Preferences
+import com.github.pixelupdater.pixelupdater.extension.toSingleLineString
+import com.github.pixelupdater.pixelupdater.wrapper.ServiceManagerProxy
+import com.github.pixelupdater.pixelupdater.wrapper.SystemPropertiesProxy
+import android.os.IBinder
+import com.topjohnwu.superuser.Shell
+import kotlinx.parcelize.Parcelize
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.jsoup.select.Elements
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.File
+import java.io.FileInputStream
+import java.io.IOException
+import java.io.OutputStream
+import java.io.RandomAccessFile
+import java.nio.channels.FileChannel
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.locks.ReentrantLock
+import java.util.regex.Pattern
+import kotlin.concurrent.withLock
+import kotlin.experimental.or
+import kotlin.math.roundToInt
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+class UpdaterThread(
+    private val context: Context,
+    private val network: Network?,
+    private val action: Action,
+    private val listener: UpdaterThreadListener,
+) : Thread() {
+    private val updateEngine: IUpdateEngine by lazy {
+        IUpdateEngine.Stub.asInterface(
+            try {
+                ServiceManagerProxy.getServiceOrThrow("android.os.UpdateEngineService")
+            } catch (e: NoSuchMethodException) {
+                // Fall back to reflection-based ServiceManager access if getServiceOrThrow is not available
+                Log.w(TAG, "getServiceOrThrow not available, falling back to reflection-based ServiceManager.getService", e)
+                getServiceViaReflection("android.os.UpdateEngineService")
+                    ?: throw IllegalStateException("UpdateEngineService is not available")
+            } catch (e: ExceptionInInitializerError) {
+                // ServiceManagerProxy failed to initialize, try direct ServiceManager access via reflection
+                Log.w(TAG, "ServiceManagerProxy failed to initialize, using ServiceManager directly via reflection", e)
+                getServiceViaReflection("android.os.UpdateEngineService")
+                    ?: throw IllegalStateException("UpdateEngineService is not available", e)
+            } catch (e: Exception) {
+                // Catch any other exceptions that might occur on QPR2 Beta2
+                Log.w(TAG, "Failed to get UpdateEngineService through ServiceManagerProxy", e)
+                getServiceViaReflection("android.os.UpdateEngineService")
+                    ?: throw IllegalStateException("UpdateEngineService is not available", e)
+            }
+        )
+    }
+
+    private val prefs = Preferences(context)
+    // NOTE: This is not implemented.
+    private val authorization: String? = null
+
+    private lateinit var logcatProcess: Process
+
+    // If we crash and restart while paused, the user will need to pause and unpause to resume
+    // because update_engine does not report the pause state.
+    var isPaused: Boolean = false
+        get() = synchronized(this) { field }
+        set(value) {
+            synchronized(this) {
+                Log.d(TAG, "Updating pause state: $value")
+                if (value) {
+                    updateEngine.suspend()
+                } else {
+                    updateEngine.resume()
+                }
+                field = value
+            }
+        }
+
+    private var engineIsBound = false
+    private val engineStatusLock = ReentrantLock()
+    private val engineStatusCondition = engineStatusLock.newCondition()
+    private var engineStatus = -1
+    private val engineErrorLock = ReentrantLock()
+    private val engineErrorCondition = engineErrorLock.newCondition()
+    private var engineError = -1
+
+    private val engineCallback = object : IUpdateEngineCallback.Stub() {
+        override fun onStatusUpdate(status: Int, percentage: Float) {
+            val statusMsg = UpdateEngineStatus.toString(status)
+            Log.d(TAG, "onStatusUpdate($statusMsg, ${percentage * 100}%)")
+
+            engineStatusLock.withLock {
+                engineStatus = status
+                engineStatusCondition.signalAll()
+            }
+
+            val max = 100
+            val current = (percentage * 100).roundToInt()
+
+            when (status) {
+                UpdateEngineStatus.DOWNLOADING -> ProgressType.UPDATE
+                UpdateEngineStatus.VERIFYING -> ProgressType.VERIFY
+                UpdateEngineStatus.FINALIZING -> ProgressType.FINALIZE
+                else -> null
+            }?.let {
+                listener.onUpdateProgress(this@UpdaterThread, it, current, max)
+            }
+        }
+
+        override fun onPayloadApplicationComplete(errorCode: Int) {
+            val errorMsg = UpdateEngineError.toString(errorCode)
+            Log.d(TAG, "onPayloadApplicationComplete($errorMsg)")
+
+            engineErrorLock.withLock {
+                engineError = errorCode
+                engineErrorCondition.signalAll()
+            }
+        }
+    }
+
+    init {
+        if (action != Action.REVERT && action != Action.NO_ROOT && network == null) {
+            throw IllegalStateException("Network is required for check and install related actions")
+        }
+
+        updateEngine.bind(engineCallback)
+        engineIsBound = true
+    }
+
+    protected fun finalize() {
+        // In case the thread is somehow not started
+        unbind()
+    }
+
+    private fun unbind() {
+        synchronized(this) {
+            if (engineIsBound) {
+                updateEngine.unbind(engineCallback)
+                engineIsBound = false
+            }
+        }
+    }
+
+    private fun waitForStatus(block: (Int) -> Boolean): Int {
+        engineStatusLock.withLock {
+            while (!block(engineStatus)) {
+                engineStatusCondition.await()
+            }
+            return engineStatus
+        }
+    }
+
+    private fun waitForError(block: (Int) -> Boolean): Int {
+        engineErrorLock.withLock {
+            while (!block(engineError)) {
+                engineErrorCondition.await()
+            }
+            return engineError
+        }
+    }
+
+    fun cancel() {
+        updateEngine.cancel()
+    }
+
+    /**
+     * Get a system service via reflection as a fallback when ServiceManagerProxy fails
+     */
+    private fun getServiceViaReflection(serviceName: String): IBinder? {
+        return try {
+            val serviceManagerClass = Class.forName("android.os.ServiceManager")
+            val getServiceMethod = serviceManagerClass.getMethod("getService", String::class.java)
+            getServiceMethod.invoke(null, serviceName) as IBinder?
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get service via reflection: $serviceName", e)
+            null
+        }
+    }
+
+    /**
+     * Returns whether the OTA URL points to a loopback or RFC1918 private address.
+     * Used to avoid binding update_engine to a physical network interface, which
+     * would otherwise break local servers (127.0.0.1) or VPN tunnels.
+     */
+    private fun isLocalHost(url: URL): Boolean {
+        val host = url.host
+        if (host.isEmpty()) return false
+        if (host == "localhost" || host == "127.0.0.1" || host == "::1") return true
+        if (host.startsWith("10.")) return true
+        if (host.startsWith("192.168.")) return true
+        // 172.16.0.0/12 covers 172.16 - 172.31
+        if (host.startsWith("172.")) {
+            val second = host.substringAfter("172.", "").substringBefore(".").toIntOrNull()
+            if (second != null && second in 16..31) return true
+        }
+        return false
+    }
+
+    private fun openUrl(url: URL): HttpURLConnection {
+        return openUrlWithRetry(url, MAX_RETRIES, INITIAL_BACKOFF_MS)
+    }
+
+    /**
+     * Opens a URL connection with VPN fallback support
+     */
+    private fun openUrlWithVpnFallback(url: URL, headers: Map<String, String> = emptyMap()): HttpURLConnection {
+        return try {
+            val net = network
+            val connection = (if (net != null && !prefs.disablePinningNetworkId) {
+                net.openConnection(url)
+            } else {
+                url.openConnection()
+            }) as HttpURLConnection
+            connection.connectTimeout = TIMEOUT_MS
+            connection.readTimeout = TIMEOUT_MS
+            connection.setRequestProperty("User-Agent", USER_AGENT)
+            if (authorization != null) {
+                connection.setRequestProperty("Authorization", authorization)
+            }
+            // Set additional headers
+            for ((key, value) in headers) {
+                connection.setRequestProperty(key, value)
+            }
+            connection
+        } catch (e: Exception) {
+            // If network binding fails (example: due to VPN), fall back to default connection
+            if (e.message?.contains("EPERM") == true || e.message?.contains("Operation not permitted") == true) {
+                Log.w(TAG, "Network binding failed (likely due to VPN), falling back to default connection", e)
+                val fallbackConnection = url.openConnection() as HttpURLConnection
+                fallbackConnection.connectTimeout = TIMEOUT_MS
+                fallbackConnection.readTimeout = TIMEOUT_MS
+                fallbackConnection.setRequestProperty("User-Agent", USER_AGENT)
+                if (authorization != null) {
+                    fallbackConnection.setRequestProperty("Authorization", authorization)
+                }
+                // Set additional headers
+                for ((key, value) in headers) {
+                    fallbackConnection.setRequestProperty(key, value)
+                }
+                fallbackConnection
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Opens and connects to a URL with VPN fallback support
+     */
+    private fun openAndConnectWithVpnFallback(url: URL, headers: Map<String, String> = emptyMap()): HttpURLConnection {
+        var connection = openUrlWithVpnFallback(url, headers)
+
+        try {
+            connection.connect()
+            return connection
+        } catch (e: Exception) {
+            // If connect fails due to VPN binding issue, try with default connection
+            if (e.message?.contains("EPERM") == true || e.message?.contains("Operation not permitted") == true) {
+                Log.w(TAG, "Connection failed due to VPN binding issue, retrying with default connection", e)
+                val fallbackConnection = url.openConnection() as HttpURLConnection
+                fallbackConnection.connectTimeout = TIMEOUT_MS
+                fallbackConnection.readTimeout = TIMEOUT_MS
+                fallbackConnection.setRequestProperty("User-Agent", USER_AGENT)
+                if (authorization != null) {
+                    fallbackConnection.setRequestProperty("Authorization", authorization)
+                }
+                // Set additional headers
+                for ((key, value) in headers) {
+                    fallbackConnection.setRequestProperty(key, value)
+                }
+                fallbackConnection.connect()
+                return fallbackConnection
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Opens a URL connection with the given headers
+     * Makes sure to set all headers before connecting
+     */
+    private fun openUrl(url: URL, headers: Map<String, String>): HttpURLConnection {
+        return openUrlWithVpnFallback(url, headers)
+    }
+
+    private fun openUrlWithRetry(url: URL, maxRetries: Int, initialBackoffMs: Long): HttpURLConnection {
+        var retryCount = 0
+        var backoffMs = initialBackoffMs
+
+        while (true) {
+            try {
+                val c = openAndConnectWithVpnFallback(url)
+
+                // Check if we got a rate limit response (429)
+                if (c.responseCode == 429) {
+                    if (retryCount >= maxRetries) {
+                        // We've exceeded our retry attempts
+                        Log.w(TAG, "Exceeded maximum retry attempts ($maxRetries) for URL: $url")
+                        break
+                    }
+
+                    // Get retry-after header if available or use exponential backoff
+                    val retryAfter = c.getHeaderField("Retry-After")?.toLongOrNull()
+                    val sleepTime = retryAfter?.times(1000) ?: backoffMs
+
+                    Log.i(TAG, "Rate limited (429). Retrying after ${sleepTime}ms (attempt ${retryCount + 1}/$maxRetries)")
+                    sleep(sleepTime)
+
+                    // Increase backoff for next attempt (exponential with jitter)
+                    backoffMs = (backoffMs * BACKOFF_MULTIPLIER).toLong().coerceAtMost(MAX_BACKOFF_MS)
+                    // Add some jitter (±20%)
+                    val jitter = (backoffMs * 0.2 * (Math.random() * 2 - 1)).toLong()
+                    backoffMs += jitter
+
+                    retryCount++
+                    continue
+                }
+
+                return c
+            } catch (e: IOException) {
+                if (retryCount >= maxRetries) {
+                    Log.w(TAG, "Exceeded maximum retry attempts ($maxRetries) due to error", e)
+                    throw e
+                }
+
+                Log.i(TAG, "Connection error, retrying (attempt ${retryCount + 1}/$maxRetries)", e)
+                sleep(backoffMs)
+
+                // Increase backoff for next attempt
+                backoffMs = (backoffMs * BACKOFF_MULTIPLIER).toLong().coerceAtMost(MAX_BACKOFF_MS)
+                retryCount++
+            }
+        }
+
+        // If we've exited the loop without returning, create one last connection to return
+        // (which will likely fail with the same error, but this maintains the original behavior)
+        return openAndConnectWithVpnFallback(url)
+    }
+
+    private fun downloadOtaPage(): List<DownloadInfo> {
+        // Create connection with cookie header and connect with VPN fallback
+        val connection = openAndConnectWithVpnFallback(URL(OTA_SERVER_URL), mapOf("Cookie" to OTA_SERVER_COOKIE))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for $OTA_SERVER_URL")
+        }
+
+        return scrapeOtaPage(connection.inputStream.bufferedReader().readText())
+    }
+
+    private fun scrapeOtaPage(otaHtml: String): List<DownloadInfo> {
+        val result = mutableListOf<DownloadInfo>()
+
+        val doc: Document = Jsoup.parse(otaHtml)
+        val deviceElements: Elements = doc.select("h2")
+
+        val buildDateMatch = BUILD_DATE_PATTERN.matcher(Build.ID)
+        buildDateMatch.find()
+        val buildDate: String = buildDateMatch.group(1)!!
+
+        for (deviceElement: Element in deviceElements) {
+            val deviceText = deviceElement.text().trim()
+            if (deviceText in listOf("Terms and conditions", "Updating instructions")) {
+                continue
+            }
+
+            val deviceId = deviceElement.attr("id")
+            if (deviceId != Build.DEVICE) {
+                continue
+            }
+
+            val table = deviceElement.nextElementSibling()
+
+            for (row: Element in table!!.select("tr").drop(1)) {
+                val columns = row.select("td")
+                val version = columns[0].text().trim()
+                val downloadUrl = columns[1].select("a").attr("href")
+
+                val parenContent = version.substringAfter("(").substringBefore(")")
+                val parts = parenContent.split(",").map { it.trim() }
+
+                val fullBuildId = parts[0]
+                val isCarrierBuild = parts.size > 2
+
+                val dateMatch = BUILD_DATE_PATTERN.matcher(fullBuildId)
+                if (!dateMatch.find()) continue
+                val date: String = dateMatch.group(1)!!
+
+                if (isCarrierBuild && !prefs.showCarrierBuilds) {
+                    continue
+                }
+
+                val isNewerDate = date.toInt() > buildDate.toInt()
+                val isSameMonthDifferentBuild = (date == buildDate && fullBuildId > Build.ID)
+                val isExactSameBuild = (fullBuildId == Build.ID)
+
+                val shouldAdd = when {
+                    isNewerDate -> true
+                    isSameMonthDifferentBuild -> true
+                    isExactSameBuild && prefs.allowReinstall -> true
+                    // If date is same but it's the exact same ID, only allow if reinstall is on
+                    date == buildDate -> prefs.allowReinstall
+                    else -> false
+                }
+
+                if (shouldAdd) {
+                    result.add(DownloadInfo(version, URL(downloadUrl), date))
+                }
+            }
+        }
+        return result
+    }
+
+    private fun downloadBetaOtaPage(): List<DownloadInfo> {
+        val results = mutableListOf<DownloadInfo>()
+        val currentMajorVersion = Build.VERSION.RELEASE.toIntOrNull() ?: 0
+
+        // 1. Stream Index to find relevant Android versions (e.g. 15, 16)
+        val versionPaths = scanIndexStream(currentMajorVersion)
+
+        for (path in versionPaths) {
+            try {
+                // 2. Stream Version Page to find all OTA page links
+                val otaUrls = scanForOtaLinks(path)
+
+                for (otaUrl in otaUrls) {
+                    try {
+                        // 3. Stream specific OTA page to extract the zip link for this device
+                        results.addAll(streamSpecificOtaPage(otaUrl))
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to stream OTA page: $otaUrl", e)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to process path $path", e)
+            }
+        }
+
+        return results.distinctBy { it.url }.sortedByDescending { it.date }
+    }
+
+    /**
+     * Reads the Index page stream line-by-line.
+     * Aborts connection immediately after "Older releases"
+     */
+    private fun scanIndexStream(currentMajor: Int): List<String> {
+        val foundPaths = mutableSetOf<String>()
+        val connection = openAndConnectWithVpnFallback(URL(VERSIONS_INDEX_URL))
+
+        try {
+            connection.inputStream.bufferedReader().use { reader ->
+                var line = reader.readLine()
+                while (line != null) {
+                    val match = VERSION_PATH_REGEX.find(line)
+                    if (match != null) {
+                        val versionString = match.groupValues[1]
+                        val versionInt = versionString.toIntOrNull()
+                        if (versionInt == null || versionInt >= currentMajor) {
+                            foundPaths.add(match.value)
+                        }
+                    }
+
+                    // Abort stream when reaching older releases
+                    if (line.contains("id=\"older-releases\"")) {
+                        break
+                    }
+                    line = reader.readLine()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Stream scan warning: ${e.message}")
+        }
+        return foundPaths.toList()
+    }
+
+    /**
+     * Scans the Version page stream for ALL "download-ota" links (QPR1, QPR2, etc.).
+     * Returns a list of full URLs.
+     * Aborts downloading once it hits the "App compatibility" section or Main Content.
+     */
+    private fun scanForOtaLinks(path: String): List<String> {
+        val foundLinks = mutableSetOf<String>()
+        val urlStr = "$ANDROID_DEVELOPER_BASE$path"
+        val connection = openAndConnectWithVpnFallback(URL(urlStr))
+
+        try {
+            connection.inputStream.bufferedReader().use { reader ->
+                var line = reader.readLine()
+                while (line != null) {
+                    if (line.contains("download-ota")) {
+                        val match = OTA_LINK_REGEX.find(line)
+                        if (match != null) {
+                            val rawLink = match.groupValues[1]
+                            val fullLink = if (rawLink.startsWith("http")) rawLink else "$ANDROID_DEVELOPER_BASE$rawLink"
+                            if (foundLinks.add(fullLink)) {
+                                Log.d(TAG, "Found OTA link: $fullLink")
+                            }
+                        }
+                    }
+
+                    // Abort if we hit the next menu section or main content
+                    if (line.contains(">App compatibility<") || line.contains("id=\"main-content\"")) {
+                        break
+                    }
+                    line = reader.readLine()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to scan version page $path: ${e.message}")
+        }
+        return foundLinks.toList()
+    }
+
+    /**
+     * Streams the specific OTA download page.
+     */
+    private fun streamSpecificOtaPage(url: String): List<DownloadInfo> {
+        val result = mutableListOf<DownloadInfo>()
+        val connection = openAndConnectWithVpnFallback(URL(url))
+
+        val deviceId = Build.DEVICE
+
+        try {
+            connection.inputStream.bufferedReader().use { reader ->
+                var line = reader.readLine()
+                var insideTargetRegion = false
+                val htmlChunk = StringBuilder()
+                var linesCaptured = 0
+
+                // We look for either the table row OR the modal dialog
+                val tableRowMarker = "id=\"$deviceId\""
+                val modalDivMarker = "id=\"${deviceId}_ota_zip\""
+
+                while (line != null) {
+                    if (!insideTargetRegion) {
+                        // Check for either the table row (stable) or the modal div (beta)
+                        if (line.contains(tableRowMarker) || line.contains(modalDivMarker)) {
+                            insideTargetRegion = true
+                            // Start chunk with a div to help Jsoup parse fragments correctly
+                            htmlChunk.append("<div>")
+                        }
+                    }
+
+                    if (insideTargetRegion) {
+                        htmlChunk.append(line).append("\n")
+                        linesCaptured++
+
+                        // If we captured enough context (row or modal content), parse it
+                        // 150 lines is enough to cover a table row OR a modal definition
+                        if (linesCaptured > 150) {
+                            htmlChunk.append("</div>")
+
+                            val doc = Jsoup.parseBodyFragment(htmlChunk.toString())
+                            val linkElement = doc.selectFirst("a[href$='.zip']")
+
+                            if (linkElement != null) {
+                                val downloadUrl = linkElement.attr("href")
+                                val fullUrl = if (downloadUrl.startsWith("http")) downloadUrl else "$ANDROID_DEVELOPER_BASE$downloadUrl"
+                                val filename = fullUrl.substringAfterLast("/").removeSuffix(".zip")
+
+                                // Try filename first, then text content
+                                var date = "0"
+                                val nameMatch = BUILD_DATE_PATTERN.matcher(filename)
+                                if (nameMatch.find()) {
+                                    date = nameMatch.group(1)!!
+                                } else {
+                                    // Fallback: Check the text in the fragment for a date string
+                                    val rowText = doc.text()
+                                    val textMatch = BUILD_DATE_PATTERN.matcher(rowText)
+                                    if (textMatch.find()) {
+                                        date = textMatch.group(1)!!
+                                    }
+                                }
+
+                                val currentBuildDate = BUILD_DATE_PATTERN.matcher(Build.ID).let {
+                                    if (it.find()) it.group(1)!! else "0"
+                                }
+
+                                if (date.toInt() > currentBuildDate.toInt() || prefs.allowReinstall) {
+                                    result.add(DownloadInfo(filename, URL(fullUrl), date))
+                                }
+
+                                // We found the link! Stop streaming.
+                                return result
+                            } else {
+                                // If we found the Table Row but NO link (it was a button),
+                                // we must reset and keep searching for the Modal further down.
+                                // If we found the Modal and no link, we are probably out of luck.
+                                if (htmlChunk.toString().contains(tableRowMarker)) {
+                                    insideTargetRegion = false
+                                    htmlChunk.clear()
+                                    linesCaptured = 0
+                                }
+                            }
+                        }
+                    }
+                    line = reader.readLine()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Hybrid scraping failed for $url: ${e.message}")
+        }
+
+        return result
+    }
+    /**
+     * Download content length with proper HEAD request
+     */
+    private fun downloadOtaContentLength(downloadInfo: DownloadInfo): Long {
+        val connection = openUrlWithVpnFallback(downloadInfo.url)
+        @Suppress("UsePropertyAccessSyntax")
+        connection.requestMethod = "HEAD"
+
+        // Connect with VPN fallback
+        try {
+            connection.connect()
+        } catch (e: Exception) {
+            if (e.message?.contains("EPERM") == true || e.message?.contains("Operation not permitted") == true) {
+                Log.w(TAG, "HEAD request failed due to VPN, retrying with default connection", e)
+                val fallbackConnection = downloadInfo.url.openConnection() as HttpURLConnection
+                fallbackConnection.connectTimeout = TIMEOUT_MS
+                fallbackConnection.readTimeout = TIMEOUT_MS
+                fallbackConnection.setRequestProperty("User-Agent", USER_AGENT)
+                if (authorization != null) {
+                    fallbackConnection.setRequestProperty("Authorization", authorization)
+                }
+                @Suppress("UsePropertyAccessSyntax")
+                fallbackConnection.requestMethod = "HEAD"
+                fallbackConnection.connect()
+
+                if (fallbackConnection.responseCode / 100 != 2) {
+                    throw IOException("Got ${fallbackConnection.responseCode} (${fallbackConnection.responseMessage}) for ${downloadInfo.url}")
+                }
+                return fallbackConnection.contentLengthLong
+            } else {
+                throw e
+            }
+        }
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for ${downloadInfo.url}")
+        }
+
+        return connection.contentLengthLong
+    }
+
+    // ===== Local OTA source (file manager) support =====
+
+    private fun localOtaFile(): File {
+        return File(OtaPaths.OTA_PACKAGE_DIR, OtaPaths.OTA_PACKAGE_NAME)
+    }
+
+    /**
+     * Handle to the selected local OTA package that can read arbitrary byte ranges.
+     *
+     * Two implementations exist:
+     *  - [DirectFdSource] reads directly from the content provider's file descriptor
+     *    (zero copy, used whenever the provider supports [ContentResolver.openFileDescriptor]).
+     *  - [CopiedFileSource] is the fallback that reads from a full local copy of the package.
+     */
+    private interface LocalOtaSource : Closeable {
+        /** Total size of the OTA package in bytes. */
+        val size: Long
+
+        /** Read [size] bytes starting at [offset]. */
+        fun readRange(offset: Long, size: Long): ByteArray
+
+        /**
+         * A [ParcelFileDescriptor] suitable for passing to [IUpdateEngine.applyPayloadFd].
+         * The caller is responsible for closing it.
+         */
+        fun openPfdForEngine(): ParcelFileDescriptor
+    }
+
+    private inner class DirectFdSource(
+        private val pfd: ParcelFileDescriptor,
+        private val stream: FileInputStream,
+    ) : LocalOtaSource {
+        // Keep a strong reference to the channel so the FileInputStream is not
+        // collected (its finalizer would close the underlying fd) while this
+        // source is still in use.
+        private val channel = stream.channel
+
+        override val size get() = channel.size()
+
+        override fun readRange(offset: Long, size: Long): ByteArray {
+            val buf = ByteBuffer.allocate(size.toInt())
+            var read = 0L
+            while (read < size) {
+                val n = channel.read(buf, offset + read)
+                if (n == -1) {
+                    throw IOException("Unexpected EOF reading local OTA at offset ${offset + read} (expected $size bytes)")
+                }
+                read += n
+            }
+            return buf.array()
+        }
+
+        override fun openPfdForEngine(): ParcelFileDescriptor = pfd.dup()
+
+        override fun close() {
+            channel.close()
+            stream.close()
+            pfd.close()
+        }
+    }
+
+    private inner class CopiedFileSource(private val file: File) : LocalOtaSource {
+        override val size get() = file.length()
+
+        override fun readRange(offset: Long, size: Long): ByteArray {
+            RandomAccessFile(file, "r").use { raf ->
+                raf.seek(offset)
+                val buf = ByteArray(size.toInt())
+                raf.readFully(buf)
+                return buf
+            }
+        }
+
+        override fun openPfdForEngine(): ParcelFileDescriptor =
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+
+        override fun close() = Unit
+    }
+
+    /**
+     * Open the selected local OTA package for random access.
+     *
+     * Prefers a direct file descriptor from the content provider so the payload never
+     * has to be copied. Falls back to copying the whole package to [OtaPaths.OTA_PACKAGE_DIR]
+     * (reusing an existing copy for the same URI) for providers that do not support
+     * [ContentResolver.openFileDescriptor].
+     */
+    private fun openLocalOtaSource(): LocalOtaSource {
+        val uriString = prefs.otaLocalUri
+            ?: throw IOException("No local OTA file selected")
+        val uri = Uri.parse(uriString)
+
+        try {
+            val pfd = context.contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IOException("openFileDescriptor returned null for $uri")
+            return try {
+                DirectFdSource(pfd, FileInputStream(pfd.fileDescriptor))
+            } catch (e: Exception) {
+                pfd.close()
+                throw e
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Direct fd for local OTA unavailable, falling back to copy: ${e.message}")
+        }
+
+        val dest = localOtaFile()
+        if (!dest.exists() || prefs.otaLocalCopiedUri != uriString) {
+            copyLocalOtaToCache(uri)
+            prefs.otaLocalCopiedUri = uriString
+        }
+        return CopiedFileSource(dest)
+    }
+
+    private fun copyLocalOtaToCache(uri: Uri): File {
+        val dir = File(OtaPaths.OTA_PACKAGE_DIR)
+        if (!dir.exists()) dir.mkdirs()
+        val dest = localOtaFile()
+        // Write to a temporary file first, then atomically move it into place so
+        // that an interrupted copy can never leave a corrupt package behind.
+        val tmp = File(dir, OtaPaths.OTA_PACKAGE_NAME + ".tmp")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                tmp.outputStream().use { output -> input.copyTo(output) }
+            } ?: throw IOException("Failed to open local OTA: $uri")
+            if (!tmp.renameTo(dest)) {
+                throw IOException("Failed to move temporary OTA file to ${dest.absolutePath}")
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
+        }
+        return dest
+    }
+
+    private fun localDownloadEocd(src: LocalOtaSource): Eocd {
+        val contentLength = src.size
+        val readLen = minOf(EOCD_OFFSET, contentLength)
+        val start = contentLength - readLen
+        val bytes = src.readRange(start, readLen)
+        val eocdHeader = byteArrayOf(0x50, 0x4b, 0x05, 0x06)
+        var eocdIndex = -1
+        for (i in bytes.size - EOCD_MIN_SIZE downTo 0) {
+            var found = true
+            for (j in eocdHeader.indices) {
+                if (bytes[i + j] != eocdHeader[j]) { found = false; break }
+            }
+            if (found) { eocdIndex = i; break }
+        }
+        if (eocdIndex == -1) throw IOException("Failed to find end of central directory")
+        val size = ByteBuffer.wrap(bytes.copyOfRange(eocdIndex + 12, eocdIndex + 16))
+            .order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+        if (size < 46 || size > 4096) throw IOException("Unexpected size of central directory ($size)")
+        val offset = ByteBuffer.wrap(bytes.copyOfRange(eocdIndex + 16, eocdIndex + 20))
+            .order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+        if (offset < 0 || offset > contentLength - size) {
+            throw IOException("Unexpected offset of central directory ($offset)")
+        }
+        return Eocd(size, offset)
+    }
+
+    private fun localDownloadCd(src: LocalOtaSource): Map<String, PropertyFile> {
+        val eocd = localDownloadEocd(src)
+        val bytes = src.readRange(eocd.offset, eocd.size)
+        val propertyFiles = mutableMapOf<String, PropertyFile>()
+        var offset = 0
+        while (offset < bytes.size) {
+            val magic = bytes.copyOfRange(offset, offset + 4)
+            if (!magic.contentEquals(byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 1, 2))) {
+                throw IOException("Unexpected file header magic ($magic)")
+            }
+            val compressionMethod = ByteBuffer.wrap(bytes.copyOfRange(offset + 10, offset + 12))
+                .order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val compressedSize = ByteBuffer.wrap(bytes.copyOfRange(offset + 20, offset + 24))
+                .order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+            val n = ByteBuffer.wrap(bytes.copyOfRange(offset + 28, offset + 30))
+                .order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val m = ByteBuffer.wrap(bytes.copyOfRange(offset + 30, offset + 32))
+                .order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val k = ByteBuffer.wrap(bytes.copyOfRange(offset + 32, offset + 34))
+                .order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val lfh = ByteBuffer.wrap(bytes.copyOfRange(offset + 42, offset + 46))
+                .order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+            val filenameBytes = bytes.copyOfRange(offset + 46, offset + 46 + n)
+            val filename = String(filenameBytes, StandardCharsets.UTF_8)
+            if (compressionMethod == 0) {
+                propertyFiles[filename] = PropertyFile(filename, (lfh + 30 + n + m), compressedSize)
+            }
+            offset += 46 + n + m + k
+        }
+        return propertyFiles
+    }
+
+    private fun localReadPropertyFile(src: LocalOtaSource, pf: PropertyFile): ByteArray {
+        return src.readRange(pf.offset, pf.size)
+    }
+
+    private fun downloadAndCheckMetadataLocal(src: LocalOtaSource, pf: PropertyFile): OtaMetadata {
+        val metadata = OtaMetadata.newBuilder().mergeFrom(localReadPropertyFile(src, pf)).build()
+        Log.d(TAG, "OTA metadata: $metadata")
+        return checkMetadata(metadata)
+    }
+
+    private fun parseKeyValueFileLocal(src: LocalOtaSource, pf: PropertyFile): Map<String, String> {
+        return parseKeyValuePairs(String(localReadPropertyFile(src, pf), Charsets.UTF_8))
+    }
+
+    private fun writeCareMapLocal(src: LocalOtaSource, pf: PropertyFile) {
+        val dest = File(OtaPaths.OTA_PACKAGE_DIR, OtaPaths.CARE_MAP_NAME)
+        dest.outputStream().use { it.write(localReadPropertyFile(src, pf)) }
+        dest.setReadable(true, false)
+    }
+
+    private fun downloadEocd(downloadInfo: DownloadInfo): Eocd {
+        val contentLength = downloadOtaContentLength(downloadInfo)
+
+        // Use VPN fallback connection with headers
+        val connection = openAndConnectWithVpnFallback(downloadInfo.url, mapOf(
+            "Range" to "bytes=${contentLength - EOCD_OFFSET}-${contentLength - 1}"
+        ))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for ${downloadInfo.url}")
+        }
+
+        if (connection.getHeaderField("Accept-Ranges") != "bytes") {
+            throw IOException("Server does not support byte ranges")
+        }
+
+        if (connection.contentLengthLong != EOCD_OFFSET) {
+            throw IOException("Expected $EOCD_OFFSET bytes, but Content-Length is ${connection.contentLengthLong}")
+        }
+
+        val responseBody = connection.inputStream.readBytes()
+        val eocdHeader = byteArrayOf(0x50, 0x4b, 0x05, 0x06)
+        var eocdIndex = -1
+        for (i in responseBody.size - EOCD_MIN_SIZE downTo 0) {
+            var found = true
+            for (j in eocdHeader.indices) {
+                if (responseBody[i + j] != eocdHeader[j]) {
+                    found = false
+                    break
+                }
+            }
+            if (found) {
+                eocdIndex = i
+                break
+            }
+        }
+
+        if (eocdIndex == -1) {
+            throw IOException("Failed to find end of central directory")
+        }
+
+        val size = ByteBuffer.wrap(responseBody.copyOfRange(eocdIndex + 12, eocdIndex + 12 + 4)).order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+        if (size < 46 || size > 1024) {
+            throw IOException("Unexpected size of central directory ($size)")
+        }
+
+        val offset = ByteBuffer.wrap(responseBody.copyOfRange(eocdIndex + 16, eocdIndex + 16 + 4)).order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+        if (offset < 0 || offset > contentLength - size) {
+            throw IOException("Unexpected offset of central directory ($offset)")
+        }
+
+        return Eocd(size, offset)
+    }
+
+    /**
+     * Download CD (Central Directory) of the OTA zip with proper headers set before connecting
+     */
+    private fun downloadCd(downloadInfo: DownloadInfo): Map<String, PropertyFile> {
+        val eocd = downloadEocd(downloadInfo)
+
+        // Create a connection with all headers set and connect with VPN fallback
+        val connection = openAndConnectWithVpnFallback(downloadInfo.url, mapOf(
+            "Range" to "bytes=${eocd.offset}-${eocd.offset + eocd.size - 1}"
+        ))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for ${downloadInfo.url}")
+        }
+
+        if (connection.getHeaderField("Accept-Ranges") != "bytes") {
+            throw IOException("Server does not support byte ranges")
+        }
+
+        if (connection.contentLengthLong != eocd.size) {
+            throw IOException("Expected ${eocd.size} bytes, but Content-Length is ${connection.contentLengthLong}")
+        }
+
+        val responseBody = connection.inputStream.readBytes()
+        val propertyFiles = mutableMapOf<String, PropertyFile>()
+        var offset = 0
+
+        while (offset < responseBody.size) {
+            val magic = responseBody.copyOfRange(offset, offset + 4)
+            if (!magic.contentEquals(byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 1, 2))) {
+                throw IOException("Unexpected file header magic ($magic)")
+            }
+
+            val compressionMethod = ByteBuffer.wrap(responseBody.copyOfRange(offset + 10, offset + 10 + 2)).order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val compressedSize = ByteBuffer.wrap(responseBody.copyOfRange(offset + 20, offset + 20 + 4)).order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+            val n = ByteBuffer.wrap(responseBody.copyOfRange(offset + 28, offset + 28 + 2)).order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val m = ByteBuffer.wrap(responseBody.copyOfRange(offset + 30, offset + 30 + 2)).order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val k = ByteBuffer.wrap(responseBody.copyOfRange(offset + 32, offset + 32 + 2)).order(ByteOrder.LITTLE_ENDIAN).short.toUShort().toInt()
+            val lfh = ByteBuffer.wrap(responseBody.copyOfRange(offset + 42, offset + 42 + 4)).order(ByteOrder.LITTLE_ENDIAN).int.toUInt().toLong()
+            val filenameBytes = responseBody.copyOfRange(offset + 46, offset + 46 + n)
+            val filename = String(filenameBytes, StandardCharsets.UTF_8)
+
+            if (compressionMethod == 0) {
+                propertyFiles[filename] = PropertyFile(filename, (lfh + 30 + n + m), compressedSize)
+            }
+
+            offset += 46 + n + m + k
+        }
+
+        return propertyFiles
+    }
+
+    /**
+     * Download a property file entry from the OTA zip. The server must support byte ranges.
+     * Uses proper headers setting before connection is made.
+     *
+     * @param output Not closed by this function
+     */
+    private fun downloadPropertyFile(url: URL, pf: PropertyFile, output: OutputStream) {
+        // Use VPN fallback approach with headers set and connect
+        val connection = openAndConnectWithVpnFallback(url, mapOf(
+            "Range" to "bytes=${pf.offset}-${pf.offset + pf.size - 1}"
+        ))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for $url")
+        }
+
+        if (connection.getHeaderField("Accept-Ranges") != "bytes") {
+            throw IOException("Server does not support byte ranges")
+        }
+
+        if (connection.contentLengthLong != pf.size) {
+            throw IOException("Expected ${pf.size} bytes, but Content-Length is ${connection.contentLengthLong}")
+        }
+
+        connection.inputStream.use { input ->
+            val buf = ByteArray(16384)
+            var downloaded = 0L
+
+            while (downloaded < pf.size) {
+                val toRead = java.lang.Long.min(buf.size.toLong(), pf.size - downloaded).toInt()
+                val n = input.read(buf, 0, toRead)
+                if (n <= 0) {
+                    break
+                }
+
+                output.write(buf, 0, n)
+                downloaded += n.toLong()
+            }
+
+            if (downloaded != pf.size) {
+                throw IOException("Unexpected EOF after downloading $downloaded bytes (expected ${pf.size} bytes)")
+            } else if (input.read() != -1) {
+                throw IOException("Server returned more data than expected (expected ${pf.size} bytes)")
+            }
+        }
+    }
+
+    /**
+     * Parse key/value pairs from properties-style files.
+     *
+     * The OTA property files format has equals-delimited key/value pairs, one on each line.
+     * Extraneous newlines, comments, and duplicate keys are not allowed.
+     */
+    private fun parseKeyValuePairs(data: String): Map<String, String> {
+        val result = hashMapOf<String, String>()
+
+        for (line in data.lineSequence()) {
+            if (line.isEmpty()) {
+                continue
+            }
+
+            val pieces = line.split("=", limit = 2)
+            if (pieces.size != 2) {
+                throw BadFormatException("Invalid property file line: $line")
+            } else if (pieces[0] in result) {
+                throw BadFormatException("Duplicate property file key: ${pieces[0]}")
+            }
+
+            result[pieces[0]] = pieces[1]
+        }
+
+        return result
+    }
+
+    /**
+     * Download and parse key/value pairs file with proper headers
+     */
+    private fun downloadKeyValueFile(url: URL, pf: PropertyFile): Map<String, String> {
+        val outputStream = ByteArrayOutputStream()
+
+        // Use VPN fallback approach with headers set and connect
+        val connection = openAndConnectWithVpnFallback(url, mapOf(
+            "Range" to "bytes=${pf.offset}-${pf.offset + pf.size - 1}"
+        ))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for $url")
+        }
+
+        if (connection.getHeaderField("Accept-Ranges") != "bytes") {
+            throw IOException("Server does not support byte ranges")
+        }
+
+        if (connection.contentLengthLong != pf.size) {
+            throw IOException("Expected ${pf.size} bytes, but Content-Length is ${connection.contentLengthLong}")
+        }
+
+        connection.inputStream.use { input ->
+            val buf = ByteArray(16384)
+            var downloaded = 0L
+
+            while (downloaded < pf.size) {
+                val toRead = java.lang.Long.min(buf.size.toLong(), pf.size - downloaded).toInt()
+                val n = input.read(buf, 0, toRead)
+                if (n <= 0) {
+                    break
+                }
+
+                outputStream.write(buf, 0, n)
+                downloaded += n.toLong()
+            }
+
+            if (downloaded != pf.size) {
+                throw IOException("Unexpected EOF after downloading $downloaded bytes (expected ${pf.size} bytes)")
+            } else if (input.read() != -1) {
+                throw IOException("Server returned more data than expected (expected ${pf.size} bytes)")
+            }
+        }
+
+        return parseKeyValuePairs(outputStream.toString(Charsets.UTF_8))
+    }
+
+    /**
+     * Download metadata protobuf file with proper headers
+     */
+    private fun downloadAndCheckMetadata(url: URL, pf: PropertyFile): OtaMetadata {
+        val outputStream = ByteArrayOutputStream()
+
+        // Use VPN fallback approach with headers set and connect
+        val connection = openAndConnectWithVpnFallback(url, mapOf(
+            "Range" to "bytes=${pf.offset}-${pf.offset + pf.size - 1}"
+        ))
+
+        if (connection.responseCode / 100 != 2) {
+            throw IOException("Got ${connection.responseCode} (${connection.responseMessage}) for $url")
+        }
+
+        if (connection.getHeaderField("Accept-Ranges") != "bytes") {
+            throw IOException("Server does not support byte ranges")
+        }
+
+        if (connection.contentLengthLong != pf.size) {
+            throw IOException("Expected ${pf.size} bytes, but Content-Length is ${connection.contentLengthLong}")
+        }
+
+        connection.inputStream.use { input ->
+            val buf = ByteArray(16384)
+            var downloaded = 0L
+
+            while (downloaded < pf.size) {
+                val toRead = java.lang.Long.min(buf.size.toLong(), pf.size - downloaded).toInt()
+                val n = input.read(buf, 0, toRead)
+                if (n <= 0) {
+                    break
+                }
+
+                outputStream.write(buf, 0, n)
+                downloaded += n.toLong()
+            }
+
+            if (downloaded != pf.size) {
+                throw IOException("Unexpected EOF after downloading $downloaded bytes (expected ${pf.size} bytes)")
+            } else if (input.read() != -1) {
+                throw IOException("Server returned more data than expected (expected ${pf.size} bytes)")
+            }
+        }
+
+        val metadata = OtaMetadata.newBuilder().mergeFrom(outputStream.toByteArray()).build()
+        Log.d(TAG, "OTA metadata: $metadata")
+        return checkMetadata(metadata)
+    }
+
+    private fun checkMetadata(metadata: OtaMetadata): OtaMetadata {
+        // Required
+        val preDevices = metadata.precondition.deviceList
+        val postSecurityPatchLevel = metadata.postcondition.securityPatchLevel
+        val postTimestamp = metadata.postcondition.timestamp * 1000
+
+        if (metadata.type != OtaMetadata.OtaType.AB) {
+            throw ValidationException("Not an A/B OTA package")
+        } else if (!preDevices.contains(Build.DEVICE)) {
+            throw ValidationException("Mismatched device ID: " +
+                    "current=${Build.DEVICE}, ota=$preDevices")
+        } else if (postSecurityPatchLevel < Build.VERSION.SECURITY_PATCH) {
+            throw ValidationException("Downgrading to older security patch is not allowed: " +
+                    "current=${Build.VERSION.SECURITY_PATCH}, ota=$postSecurityPatchLevel")
+        } else if (postTimestamp < Build.TIME && !prefs.allowReinstall) {
+            throw ValidationException("Downgrading to older timestamp is not allowed: " +
+                    "current=${Build.TIME}, ota=$postTimestamp")
+        }
+
+        // Optional
+        val preBuildIncremental = metadata.precondition.buildIncremental
+        val preBuilds = metadata.precondition.buildList
+
+        if (preBuildIncremental.isNotEmpty() && preBuildIncremental != Build.VERSION.INCREMENTAL) {
+            throw ValidationException("Mismatched incremental version: " +
+                    "current=${Build.VERSION.INCREMENTAL}, ota=$preBuildIncremental")
+        } else if (preBuilds.isNotEmpty() && !preBuilds.contains(Build.FINGERPRINT)) {
+            throw ValidationException("Mismatched fingerprint: " +
+                    "current=${Build.FINGERPRINT}, ota=$preBuilds")
+        }
+
+        return metadata
+    }
+
+    /**
+     * Download the dm-verity care map to [OtaPaths.OTA_PACKAGE_DIR].
+     *
+     * Returns the path to the written file.
+     */
+    @SuppressLint("SetWorldReadable")
+    private fun downloadCareMap(url: URL, pf: PropertyFile): File {
+        val file = File(OtaPaths.OTA_PACKAGE_DIR, OtaPaths.CARE_MAP_NAME)
+
+        try {
+            file.outputStream().use { out ->
+                downloadPropertyFile(url, pf, out)
+            }
+            file.setReadable(true, false)
+        } catch (e: Exception) {
+            file.delete()
+            throw e
+        }
+
+        return file
+    }
+
+    private fun parseVersionFromMetadata(metadata: OtaMetadata, fingerprint: String): String {
+        return try {
+            val parts = fingerprint.split(":")
+            if (parts.size >= 2) {
+                val buildParts = parts[1].split("/")
+                if (buildParts.size >= 2) {
+                    val androidVer = buildParts[0]
+                    val buildId = buildParts[1]
+                    val spl = metadata.postcondition.securityPatchLevel
+                    if (!spl.isNullOrEmpty()) {
+                        "$androidVer ($buildId, $spl)"
+                    } else {
+                        "$androidVer ($buildId)"
+                    }
+                } else {
+                    parts[1]
+                }
+            } else {
+                fingerprint
+            }
+        } catch (_: Exception) {
+            fingerprint
+        }
+    }
+
+    /** Synchronously check for updates. */
+
+    private fun checkForUpdates(): List<CheckUpdateResult> {
+        if (prefs.otaCache.isNotEmpty()) {
+            return Json.decodeFromString(prefs.otaCache)
+        }
+
+        val localUri = prefs.otaLocalUri
+        if (localUri != null) {
+            openLocalOtaSource().use { src ->
+                val cd = localDownloadCd(src)
+                val pfMetadata = cd[OtaPaths.METADATA_NAME]!!
+                val metadata = downloadAndCheckMetadataLocal(src, pfMetadata)
+
+                if (metadata.postcondition.buildCount != 1) {
+                    throw ValidationException("Metadata postcondition lists multiple fingerprints")
+                }
+                val fingerprint = metadata.postcondition.getBuild(0)
+                val version = parseVersionFromMetadata(metadata, fingerprint)
+                val result = CheckUpdateResult(
+                    version,
+                    fingerprint,
+                    localUri,
+                    cd,
+                    isLocal = true,
+                )
+                prefs.otaCache = Json.encodeToString(listOf(result))
+                return listOf(result)
+            }
+        }
+
+        val downloads = if (prefs.otaUrl != null) {
+            val uri = Uri.parse(prefs.otaUrl.toString())
+            mutableListOf(DownloadInfo(uri.lastPathSegment!!, prefs.otaUrl!!))
+        } else {
+            try {
+                // Check preference to decide which scraping logic to use
+                if (prefs.useBetaChannel) {
+                    downloadBetaOtaPage()
+                } else {
+                    downloadOtaPage()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Update check failed", e)
+                throw IOException("Failed to download update info", e)
+            }
+        }
+
+        val updates = mutableListOf<CheckUpdateResult>()
+        for (ota in downloads) {
+            Log.d(TAG, "OTA URL: ${ota.url}")
+            try {
+                val cd = downloadCd(ota)
+                val pfMetadata = cd[OtaPaths.METADATA_NAME]!!
+                val metadata = downloadAndCheckMetadata(ota.url, pfMetadata)
+
+                if (metadata.postcondition.buildCount != 1) {
+                    throw ValidationException("Metadata postcondition lists multiple fingerprints")
+                }
+                val fingerprint = metadata.postcondition.getBuild(0)
+
+                updates.add(CheckUpdateResult(
+                    ota.version,
+                    fingerprint,
+                    ota.url.toString(),
+                    cd,
+                ))
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to process metadata for ${ota.version}, skipping.", e)
+                continue // Skip broken links instead of crashing the whole check
+            }
+        }
+
+        val cache = Json.encodeToString(updates)
+        prefs.otaCache = cache
+        return updates
+    }
+
+    /** Asynchronously trigger the update_engine payload application. */
+    private fun startInstallation(otaUrl: URL, cd: Map<String, PropertyFile>, isLocal: Boolean = false) {
+        val pfPayload = cd[OtaPaths.PAYLOAD_NAME]!!
+        val pfPayloadProperties = cd[OtaPaths.PAYLOAD_PROPERTIES_NAME]!!
+        val pfCareMap = cd[OtaPaths.CARE_MAP_NAME]
+
+        val localSrc = if (isLocal) openLocalOtaSource() else null
+
+        try {
+            Log.i(TAG, "Downloading dm-verity care map file")
+
+            if (pfCareMap != null) {
+                if (localSrc != null) {
+                    writeCareMapLocal(localSrc, pfCareMap)
+                } else {
+                    downloadCareMap(otaUrl, pfCareMap)
+                }
+            } else {
+                Log.w(TAG, "OTA package does not have a dm-verity care map")
+            }
+
+            Log.i(TAG, "Downloading payload properties file")
+
+            val payloadProperties = if (localSrc != null) {
+                parseKeyValueFileLocal(localSrc, pfPayloadProperties)
+            } else {
+                downloadKeyValueFile(otaUrl, pfPayloadProperties)
+            }
+            prefs.payloadPropertiesCache = Json.encodeToString(payloadProperties)
+
+            Log.i(TAG, "Passing payload information to update_engine")
+
+            val engineProperties = HashMap(payloadProperties).apply {
+                if (!isLocal && !prefs.disablePinningNetworkId && !isLocalHost(otaUrl) && network != null) {
+                    put("NETWORK_ID", network.networkHandle.toString())
+                } else {
+                    Log.i(TAG, "Skipping NETWORK_ID binding (local source, local host, or network pinning disabled)")
+                }
+                put("USER_AGENT", USER_AGENT_UPDATE_ENGINE)
+
+                if (authorization != null) {
+                    Log.i(TAG, "Passing authorization header to update_engine")
+                    put("AUTHORIZATION", authorization)
+                }
+
+                if (prefs.skipPostInstall) {
+                    put("RUN_POST_INSTALL", "0")
+                }
+
+                if (!prefs.automaticSwitchSlot) {
+                    put("SWITCH_SLOT_ON_REBOOT", "0")
+                }
+            }
+
+            val enginePropertiesArray = engineProperties.map { "${it.key}=${it.value}" }.toTypedArray()
+            if (localSrc != null) {
+                localSrc.openPfdForEngine().use { pfd ->
+                    updateEngine.applyPayloadFd(
+                        pfd,
+                        pfPayload.offset,
+                        pfPayload.size,
+                        enginePropertiesArray,
+                    )
+                }
+            } else {
+                updateEngine.applyPayload(
+                    otaUrl.toString(),
+                    pfPayload.offset,
+                    pfPayload.size,
+                    enginePropertiesArray,
+                )
+            }
+        } finally {
+            localSrc?.close()
+        }
+    }
+
+    private fun switchSlot(otaUrl: URL, cd: Map<String, PropertyFile>, isLocal: Boolean = false) {
+        // https://android.googlesource.com/platform/bootable/recovery/+/refs/tags/android-13.0.0_r82/updater_sample/src/com/example/android/systemupdatersample/UpdateManager.java#406
+        val pfPayload = cd[OtaPaths.PAYLOAD_NAME]!!
+        val payloadProperties = Json.decodeFromString<Map<String, String>>(prefs.payloadPropertiesCache)
+
+        Log.i(TAG, "Passing payload information to update_engine")
+
+        val engineProperties = HashMap(payloadProperties).apply {
+            // https://android.googlesource.com/platform/bootable/recovery/+/refs/tags/android-13.0.0_r82/updater_sample/src/com/example/android/systemupdatersample/UpdateManager.java#408
+            put("RUN_POST_INSTALL", "0")
+            put("SWITCH_SLOT_ON_REBOOT", "1")
+        }
+
+        val enginePropertiesArray = engineProperties.map { "${it.key}=${it.value}" }.toTypedArray()
+        val localSrc = if (isLocal) openLocalOtaSource() else null
+        try {
+            if (localSrc != null) {
+                localSrc.openPfdForEngine().use { pfd ->
+                    updateEngine.applyPayloadFd(
+                        pfd,
+                        pfPayload.offset,
+                        pfPayload.size,
+                        enginePropertiesArray,
+                    )
+                }
+            } else {
+                updateEngine.applyPayload(
+                    otaUrl.toString(),
+                    pfPayload.offset,
+                    pfPayload.size,
+                    enginePropertiesArray,
+                )
+            }
+        } finally {
+            localSrc?.close()
+        }
+    }
+
+    // https://github.com/topjohnwu/Magisk/blob/v26.3/app/src/main/java/com/topjohnwu/magisk/core/tasks/MagiskInstaller.kt#L537-L538
+    private fun flashSecondSlot() =
+        findSecondary() && flashBoot()
+
+    private fun checkSecondSlot(): Boolean {
+        if (!findSecondary()) {
+            return false
+        }
+
+        Log.d(TAG, "Checking if Magisk is installed on inactive slot")
+
+        // First try normal check which may fail for init_boot partitions
+        val standardCheck = checkBoot()
+        if (standardCheck) {
+            Log.d(TAG, "Magisk detected through standard check")
+            return true
+        }
+
+        Log.d(TAG, "Standard check failed, trying direct detection")
+
+        // Direct detection on both boot and init_boot partitions (init_boot prioritized)
+        val slot = SystemPropertiesProxy.get("ro.boot.slot_suffix")
+        val target = if (slot == "_a") "_b" else "_a"
+
+        val result = Shell.cmd(
+            "for PART in init_boot$target boot$target; do " +
+            "  if [ -e /dev/block/by-name/\$PART ]; then " +
+            "    dd if=/dev/block/by-name/\$PART bs=4096 count=10 2>/dev/null | " +
+            "    strings | grep -q 'Magisk' && echo \"found_magisk_in_\$PART\" || echo \"not_found_in_\$PART\"; " +
+            "  fi; " +
+            "done"
+        ).exec()
+
+        val output = result.out.joinToString("\n")
+        Log.d(TAG, "Direct detection results: $output")
+
+        return output.contains("found_magisk")
+    }
+
+    // https://github.com/topjohnwu/Magisk/blob/v26.3/app/src/main/java/com/topjohnwu/magisk/core/tasks/MagiskInstaller.kt#L78-L94
+    private fun findSecondary(): Boolean {
+        if (!shellInit()) {
+            return false
+        }
+        val slot = Shell.cmd("echo \$SLOT").exec().out.first()
+        val target = if (slot == "_a") "_b" else "_a"
+
+        // First check for init_boot partition
+        Log.d(TAG, "Checking for init_boot$target partition")
+        val initBootExists = Shell.cmd("[ -e /dev/block/by-name/init_boot$target ] && echo 1 || echo 0").exec().out.firstOrNull() == "1"
+
+        if (initBootExists) {
+            Log.d(TAG, "Found init_boot$target partition")
+            val result = Shell.cmd(
+                "SLOT=$target",
+                "export BOOTIMAGE=/dev/block/by-name/init_boot$target",
+                "echo \"\$BOOTIMAGE\""
+            ).exec()
+
+            if (result.isSuccess && result.out.firstOrNull() != null) {
+                Log.d(TAG, "Using init_boot partition: ${result.out.first()}")
+                return true
+            }
+        }
+
+        // Fall back to standard boot partition lookup
+        Log.d(TAG, "Falling back to boot partition")
+        val bootPath = Shell.cmd(
+            "SLOT=$target",
+            "find_boot_image",
+            "SLOT=$slot",
+            "echo \"\$BOOTIMAGE\""
+        ).exec().out.firstOrNull()
+
+        if (bootPath == null) {
+            Log.e(TAG, "! Unable to detect target image")
+            return false
+        }
+
+        Log.d(TAG, "Using boot image: $bootPath")
+        return true
+    }
+
+    private fun flashBoot(): Boolean {
+        Log.d(TAG, "Flashing boot image with Magisk")
+
+        // install_magisk runs in a subshell so that boot_patch.sh's abort() cannot
+        // kill the persistent root shell mid-job: libsu reports a killed shell as
+        // exit code 1 for the running task, and afterwards every command silently
+        // restarts with a wiped environment.
+        //
+        // The subshell is also self-sufficient: it re-sources util_functions.sh
+        // when the install functions are missing (shell session was replaced),
+        // mirrors the official app's environment (PATH, MAGISKTMP) and re-derives
+        // $BOOTIMAGE from the device instead of trusting inherited variables. An
+        // empty BOOTIMAGE would otherwise send flash_image down its "Not block or
+        // char device" path and write the image to an empty name: no flash, no error.
+        val result = Shell.cmd(
+            "(" +
+            "cd $MAGISKBIN; " +
+            "export PATH=$MAGISKBIN:\$PATH; " +
+            "if ! type install_magisk >/dev/null 2>&1; then " +
+                ". ./util_functions.sh; " +
+                "mount_partitions 2>/dev/null; " +
+                "get_flags; " +
+            "fi; " +
+            "export MAGISKTMP=\$(magisk --path 2>/dev/null); " +
+            "if [ ! -b \"\$BOOTIMAGE\" ]; then " +
+                "SLOT=\$(getprop ro.boot.slot_suffix); " +
+                "[ \"\$SLOT\" = \"_a\" ] && SLOT=_b || SLOT=_a; " +
+                "export BOOTIMAGE=/dev/block/by-name/init_boot\$SLOT; " +
+            "fi; " +
+            "if [ ! -b \"\$BOOTIMAGE\" ]; then " +
+                "echo \"! BOOTIMAGE is not a block device: \$BOOTIMAGE\"; " +
+                "exit 1; " +
+            "fi; " +
+            "install_magisk" +
+            ")"
+        ).exec()
+
+        val output = result.out.joinToString("\n")
+        File(context.getExternalFilesDir(null), "magisk.log").writeText(output)
+
+        // Log detailed results for debugging
+        Log.d(TAG, "Magisk install exit code: ${result.code}")
+        Log.d(TAG, "Magisk install success flag: ${result.isSuccess}")
+
+        // Neither the exit code nor the output is a usable success signal:
+        //  * "- Flashing new boot image" is printed *before* flash_image writes a
+        //    single byte, and flash_image returns 0 even when the write failed;
+        //  * a non-zero exit can be the harmless "Unable to find preinit dir"
+        //    warning from copy_preinit_files;
+        //  * abort()'s messages ("! Insufficient partition size", "! <img> is read
+        //    only") were never part of the old string blacklist.
+        // Verify on the device instead: the inactive slot's boot image must now
+        // actually carry the Magisk ramdisk patch.
+        val failed = INSTALL_FAILURE_OUTPUT.any { output.contains(it) }
+        val success = !failed && checkBoot()
+
+        Log.d(TAG, "Determined success: $success")
+
+        return success
+    }
+
+    private fun checkBoot(): Boolean {
+        Log.d(TAG, "Checking boot image for Magisk")
+        val status = Shell.cmd(
+            "cd $MAGISKBIN",
+            "./magiskboot unpack \"\$BOOTIMAGE\"",
+            "if [ -e ramdisk.cpio ]; then ./magiskboot cpio ramdisk.cpio test; else (exit 0); fi"
+        ).exec().code
+        Shell.cmd("./magiskboot cleanup").exec()
+        return status == 1
+    }
+
+    @OptIn(ExperimentalStdlibApi::class)
+    private fun setVbmetaFlags(flags: Byte): Boolean {
+        val slot = SystemPropertiesProxy.get("ro.boot.slot_suffix")
+        val target = if (slot == "_a") "_b" else "_a"
+
+        val vbmeta = File("/dev/block/by-name/vbmeta$target")
+
+        if (!hasMagic(vbmeta)) {
+            Log.e(TAG, "Unexpected Format")
+            return false
+        }
+        val byte = flags.toHexString(HexFormat.Default)
+        return Shell.cmd(
+            "blockdev --setrw $vbmeta",
+            // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-12.0.0_r12/libavb/avb_vbmeta_image.h#174
+            "printf '\\x$byte' | dd of=$vbmeta bs=1 seek=123 count=1 conv=notrunc status=none",
+            "blockdev --setro $vbmeta"
+        ).exec().isSuccess
+    }
+
+    private fun startLogcat() {
+        assert(!this::logcatProcess.isInitialized) { "logcat already started" }
+
+        Log.d(TAG, "Starting log file (${BuildConfig.VERSION_NAME})")
+
+        val logcatFile = File(context.getExternalFilesDir(null),
+            "${action.name.lowercase()}.log")
+        logcatProcess = ProcessBuilder("logcat", "*:V")
+            // This is better than -f because the logcat implementation calls fflush() when the
+            // output stream is stdout.
+            .redirectOutput(logcatFile)
+            .redirectErrorStream(true)
+            .start()
+    }
+
+    private fun stopLogcat() {
+        assert(this::logcatProcess.isInitialized) { "logcat not started" }
+
+        try {
+            Log.d(TAG, "Stopping log file")
+
+            // Give logcat a bit of time to flush the output. It does not have any special
+            // handling to flush buffers when interrupted.
+            sleep(1000)
+
+            logcatProcess.destroy()
+        } finally {
+            logcatProcess.waitFor()
+        }
+    }
+
+    @SuppressLint("WakelockTimeout")
+    override fun run() {
+        startLogcat()
+
+        val pm = context.getSystemService(PowerManager::class.java)
+        val wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG)
+
+        try {
+            wakeLock.acquire()
+
+            listener.onUpdateProgress(this, ProgressType.INIT, 0, 0)
+
+            Log.d(TAG, "Waiting for initial engine status")
+            val status = waitForStatus { it != -1 }
+            val statusStr = UpdateEngineStatus.toString(status)
+            Log.d(TAG, "Initial status: $statusStr")
+
+            if (action == Action.REVERT) {
+                updateEngine.resetStatus()
+
+                val newStatus = waitForStatus { it != UpdateEngineStatus.UPDATED_NEED_REBOOT }
+                val newStatusStr = UpdateEngineStatus.toString(newStatus)
+                Log.d(TAG, "New status after revert: $newStatusStr")
+
+                if (newStatus == UpdateEngineStatus.IDLE) {
+                    if (getVbmetaFlags(active = false) != 0.toByte() && getVbmetaFlags(active = true) == 0.toByte()) {
+                        setVbmetaFlags(0.toByte())
+                    }
+                    listener.onUpdateResult(this, UpdateReverted)
+                } else {
+                    listener.onUpdateResult(this, UpdateFailed(newStatusStr))
+                }
+            } else if (action == Action.NO_ROOT) {
+                listener.onUpdateResult(this, RootUnavailable)
+                return
+            } else if (status == UpdateEngineStatus.UPDATED_NEED_REBOOT) {
+                if (prefs.magiskPatch) {
+                    if (!checkSecondSlot()) {
+                        if (!flashSecondSlot()) {
+                            listener.onUpdateResult(this, UpdatePatchFailed("Failed to Magisk patch inactive slot"))
+                            return
+                        }
+                    }
+                }
+                if (prefs.vbmetaPatch) {
+                    val expectedFlags = DISABLE_VERITY_FLAG.or(if (prefs.verityOnly) 0.toByte() else DISABLE_VERIFICATION_FLAG)
+                    if (getVbmetaFlags() != expectedFlags) {
+                        if (!setVbmetaFlags(expectedFlags)) {
+                            listener.onUpdateResult(this, UpdatePatchFailed("Failed to disable verity ${if (prefs.verityOnly) "" else "and verification"}"))
+                            return
+                        }
+                    }
+                }
+                Log.d(TAG, "Successfully completed upgrade")
+                listener.onUpdateResult(this, UpdateNeedReboot)
+            } else {
+                if (status == UpdateEngineStatus.IDLE) {
+                    Log.d(TAG, "Starting new update because engine is idle")
+
+                    listener.onUpdateProgress(this, ProgressType.CHECK, 0, 0)
+
+                    if (action == Action.CHECK) {
+                        if (prefs.mismatchAllowed) {
+                            if (prefs.hasRoot) {
+                                val expectedFlags = prefs.lastVbmetaState.toByte()
+                                val actualFlags = getVbmetaFlags(active = true)
+                                if (actualFlags != expectedFlags) {
+                                    prefs.mismatchAllowed = false
+                                }
+                                prefs.lastVbmetaState = actualFlags?.toInt() ?: 0
+                            }
+                        }
+                        if (!prefs.mismatchAllowed) {
+                            if (prefs.hasRoot) {
+                                val expectedFlags = if (prefs.vbmetaPatch) DISABLE_VERITY_FLAG.or(if (prefs.verityOnly) 0.toByte() else DISABLE_VERIFICATION_FLAG) else 0.toByte()
+                                val actualFlags = getVbmetaFlags(active = true)
+                                prefs.lastVbmetaState = actualFlags?.toInt() ?: 0
+                                if (!prefs.magiskPatch) {
+                                    if (actualFlags != expectedFlags) {
+                                        listener.onUpdateResult(this, UpdateMismatch)
+                                    } else {
+                                        listener.onUpdateResult(this, UpdateMismatchMagisk)
+                                    }
+                                    return
+                                } else if (actualFlags != expectedFlags) {
+                                    listener.onUpdateResult(this, UpdateMismatchVbmeta)
+                                    return
+                                }
+                            } else if (prefs.magiskPatch || prefs.vbmetaPatch) {
+                                listener.onUpdateResult(this, RootUnavailable)
+                                return
+                            } else {
+                                listener.onUpdateResult(this, UpdateMismatchRootUnavailable)
+                                return
+                            }
+                        }
+                        prefs.otaCache = ""
+                    }
+
+                    val checkUpdateResult = checkForUpdates()
+
+                    if (checkUpdateResult.isEmpty()) {
+                        // Update not needed
+                        listener.onUpdateResult(this, UpdateUnnecessary)
+                        return
+                    } else if (action == Action.CHECK) {
+                        if (checkUpdateResult.available().isEmpty()) {
+                            prefs.updateNotified = false
+                            listener.onUpdateResult(this, UpdateUnnecessary)
+                            return
+                        } else {
+                            val versions = mutableListOf<Result>()
+                            for ((index, update) in checkUpdateResult.available().withIndex()) {
+                                versions.add(UpdateAvailable(update.version, index))
+                            }
+                            prefs.updateNotified = true
+                            listener.onUpdateResults(this, versions)
+                            return
+                        }
+                    }
+
+                    val targetUpdate = checkUpdateResult.get(prefs.targetOta)
+                    if (targetUpdate == null) {
+                        listener.onUpdateResult(this, UpdateFailed("OTA is missing"))
+                        return
+                    } else {
+                        if (action == Action.INSTALL) {
+                            startInstallation(
+                                URL(targetUpdate.otaUrl),
+                                targetUpdate.cd,
+                                targetUpdate.isLocal,
+                            )
+                        } else if (action == Action.SWITCH_SLOT) {
+                            switchSlot(
+                                URL(targetUpdate.otaUrl),
+                                targetUpdate.cd,
+                                targetUpdate.isLocal,
+                            )
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "Monitoring existing update because engine is not idle")
+                }
+
+                val error = waitForError { it != -1 }
+                val errorStr = UpdateEngineError.toString(error)
+                Log.d(TAG, "Update engine result: $errorStr")
+
+                when (error) {
+                    UpdateEngineError.SUCCESS -> {
+                        if (prefs.magiskPatch) {
+                            if (!flashSecondSlot()) {
+                                listener.onUpdateResult(this, UpdatePatchFailed("Failed to Magisk patch inactive slot"))
+                                return
+                            }
+                        }
+                        if (prefs.vbmetaPatch) {
+                            if (!setVbmetaFlags(DISABLE_VERITY_FLAG.or(if (prefs.verityOnly) 0.toByte() else DISABLE_VERIFICATION_FLAG))) {
+                                listener.onUpdateResult(this, UpdatePatchFailed("Failed to disable verity ${if (prefs.verityOnly) "" else "and verification"}"))
+                                return
+                            }
+                        }
+                        Log.d(TAG, "Successfully completed upgrade")
+                        prefs.updateNotified = false
+                        if (prefs.automaticReboot) {
+                            context.getSystemService(PowerManager::class.java).reboot(null)
+                        }
+                        listener.onUpdateResult(this, UpdateSucceeded)
+                    }
+                    UpdateEngineError.UPDATED_BUT_NOT_ACTIVE -> {
+                        Log.d(TAG, "Successfully completed upgrade, but not active")
+                        listener.onUpdateResult(this, UpdateNeedSwitchSlot)
+                    }
+                    UpdateEngineError.USER_CANCELED -> {
+                        Log.w(TAG, "User cancelled upgrade")
+                        listener.onUpdateResult(this, UpdateCancelled)
+                    }
+                    else -> throw Exception(errorStr)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to install update", e)
+            listener.onUpdateResult(this, UpdateFailed(e.toSingleLineString()))
+        } finally {
+            wakeLock.release()
+            unbind()
+
+            try {
+                stopLogcat()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to dump logcat", e)
+            }
+        }
+    }
+
+    class BadFormatException(msg: String, cause: Throwable? = null)
+        : Exception(msg, cause)
+
+    class ValidationException(msg: String, cause: Throwable? = null)
+        : Exception(msg, cause)
+
+    @Serializable
+    private data class CheckUpdateResult(
+        val version: String,
+        val fingerprint: String,
+        val otaUrl: String,
+        val cd: Map<String, PropertyFile>,
+        val isLocal: Boolean = false,
+    )
+
+    @Serializable
+    private data class PropertyFile(
+        val name: String,
+        val offset: Long,
+        val size: Long,
+    )
+
+    @Parcelize
+    enum class Action : Parcelable {
+        CHECK,
+        INSTALL,
+        REVERT,
+        SWITCH_SLOT,
+        NO_ROOT,
+        REBOOT,
+    }
+
+    private fun List<CheckUpdateResult>.available() = filter { it.fingerprint != Build.FINGERPRINT || prefs.allowReinstall }
+    private fun List<CheckUpdateResult>.get(version: String) = firstOrNull { it.version == version }
+
+    private data class DownloadInfo(
+        val version: String,
+        val url: URL,
+        val date: String? = null,
+    )
+
+    private data class Eocd(
+        val size: Long,
+        val offset: Long,
+    )
+
+    sealed interface Result {
+        val isError : Boolean
+    }
+
+    data object UpdateMismatch : Result {
+        override val isError = true
+    }
+
+    data object UpdateMismatchMagisk : Result {
+        override val isError = true
+    }
+
+    data object UpdateMismatchRootUnavailable : Result {
+        override val isError = true
+    }
+
+    data object UpdateMismatchVbmeta : Result {
+        override val isError = true
+    }
+
+    data object RootUnavailable : Result {
+        override val isError = true
+    }
+
+    data object RootUnnecessary : Result {
+        override val isError = false
+    }
+
+    data object NetworkUnavailable : Result {
+        override val isError = true
+    }
+
+    data class UpdateAvailable(val version: String, val index: Int) : Result {
+        override val isError = false
+    }
+
+    data object UpdateUnnecessary : Result {
+        override val isError = false
+    }
+
+    data object UpdateSucceeded : Result {
+        override val isError = false
+    }
+
+    data object UpdateNeedSwitchSlot : Result {
+        override val isError = false
+    }
+
+    /** Update succeeded in a previous updater run. */
+    data object UpdateNeedReboot : Result {
+        override val isError = false
+    }
+
+    data object UpdateReverted : Result {
+        override val isError = false
+    }
+
+    data object UpdateCancelled : Result {
+        override val isError = true
+    }
+
+    data class UpdateFailed(val errorMsg: String, val action: Action? = null) : Result {
+        override val isError = true
+    }
+
+    data class CheckSkipped(val errorMsg: String, val action: Action) : Result {
+        override val isError = false
+    }
+
+    data class UpdatePatchFailed(val errorMsg: String) : Result {
+        override val isError = true
+    }
+
+    enum class ProgressType {
+        INIT,
+        CHECK,
+        UPDATE,
+        VERIFY,
+        FINALIZE,
+    }
+
+    interface UpdaterThreadListener {
+        fun onUpdateResult(thread: UpdaterThread, result: Result)
+
+        fun onUpdateResults(thread: UpdaterThread, results: List<Result>)
+
+        fun onUpdateProgress(thread: UpdaterThread, type: ProgressType, current: Int, max: Int)
+    }
+
+    companion object {
+        private val TAG = UpdaterThread::class.java.simpleName
+
+        private const val OTA_SERVER_URL = "https://developers.google.com/android/ota"
+        private const val OTA_SERVER_COOKIE = "devsite_wall_acks=nexus-image-tos,nexus-ota-tos"
+        private const val ANDROID_DEVELOPER_BASE = "https://developer.android.com"
+        private const val VERSIONS_INDEX_URL = "$ANDROID_DEVELOPER_BASE/about/versions"
+        private const val USER_AGENT = "${BuildConfig.APPLICATION_ID}/${BuildConfig.VERSION_NAME}"
+        private val USER_AGENT_UPDATE_ENGINE = "$USER_AGENT update_engine/${Build.VERSION.SDK_INT}"
+
+        // Pre-compile regex to avoid overhead in loops
+        private val BUILD_DATE_PATTERN = Pattern.compile("\\b(\\d{6})\\b")
+        private val VERSION_PATH_REGEX = Regex("/about/versions/([a-zA-Z0-9-]+)")
+        private val OTA_LINK_REGEX = Regex("href=\"([^\"]*download-ota[^\"]*)\"")
+
+        private const val EOCD_MIN_SIZE = 22
+        private const val EOCD_OFFSET = 3072L
+        private const val TIMEOUT_MS = 30_000
+        private const val MAGISKBIN = "/data/adb/magisk"
+
+        // Output fragments that prove install_magisk failed. All of boot_patch.sh's
+        // abort() messages begin with "!". Note that "Unable to find preinit dir" is
+        // deliberately not listed: it only means the module sepolicy rules could not
+        // be installed, not that the boot image failed to flash.
+        private val INSTALL_FAILURE_OUTPUT = arrayOf(
+            "Installation failed",
+            "Abort",
+            "Error:",
+            "fatal:",
+            "does not exist!",
+            "Insufficient partition size",
+            "is read only",
+            "Unable to unpack boot image",
+            "unsupported programs",
+            "Unable to patch ramdisk",
+            "Not block or char device",
+            "BOOTIMAGE is not a block device",
+        )
+
+        private const val VBMETA_MAGIC: String = "AVB0"
+        const val DISABLE_VERITY_FLAG: Byte = 1
+        const val DISABLE_VERIFICATION_FLAG: Byte = 2
+
+        // Retry parameters
+        private const val MAX_RETRIES = 3
+        private const val INITIAL_BACKOFF_MS = 2000L  // 2 seconds
+        private const val BACKOFF_MULTIPLIER = 1.5    // Each retry waits 1.5x longer
+        private const val MAX_BACKOFF_MS = 30000L     // Cap at 30 seconds
+
+        // https://github.com/topjohnwu/Magisk/blob/v26.3/app/src/main/java/com/topjohnwu/magisk/core/utils/ShellInit.kt#L65-69
+        // https://github.com/topjohnwu/Magisk/blob/v26.3/app/src/main/res/raw/manager.sh#L232-L240
+        // Mirror the environment the official Magisk app sets up in its root shell
+        // (core/utils/ShellInit.kt): put $MAGISKBIN on PATH and export $MAGISKTMP.
+        // Without MAGISKTMP, Magisk >= 27's install_magisk ends with run_migrations
+        // -> copy_preinit_files, which fails with "Unable to find preinit dir" and
+        // returns non-zero even when the boot image was flashed successfully.
+        private fun shellInit() : Boolean {
+            if (Shell.cmd("[ ! -z \$SLOT ]").exec().isSuccess) {
+                return true
+            }
+            return Shell.cmd(
+                "cd $MAGISKBIN",
+                "export PATH=$MAGISKBIN:\$PATH",
+                ". ./util_functions.sh",
+                "mount_partitions",
+                "get_flags",
+                "export MAGISKTMP=\$($MAGISKBIN/magisk --path 2>/dev/null)"
+            ).exec().isSuccess
+        }
+
+        fun getVbmetaFlags(active: Boolean? = false): Byte? {
+            val slot = SystemPropertiesProxy.get("ro.boot.slot_suffix")
+            val target = if (active == true) slot else if (slot == "_a") "_b" else "_a"
+
+            val vbmeta = File("/dev/block/by-name/vbmeta$target")
+
+            if (!hasMagic(vbmeta)) {
+                Log.e(TAG, "Unexpected Format")
+                return null
+            }
+            // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-12.0.0_r12/libavb/avb_vbmeta_image.h#174
+            return Shell.cmd("dd if=$vbmeta bs=1 skip=123 count=1 status=none | xxd -p").exec().out.first().toByte()
+        }
+
+        private fun hasMagic(vbmeta: File) : Boolean {
+            // https://android.googlesource.com/platform/external/avb/+/refs/tags/android-12.0.0_r12/libavb/avb_vbmeta_image.h#126
+            val magicResult = Shell.cmd("dd if=$vbmeta bs=1 count=4 status=none").exec()
+            if (!magicResult.isSuccess || magicResult.out.isEmpty()) {
+                Log.e(TAG, "Failed to get magic")
+                return false
+            }
+            return magicResult.out[0] == VBMETA_MAGIC
+        }
+
+        /**
+         * Get the current status from update engine synchronously
+         */
+        fun getCurrentEngineStatus(updateEngine: IUpdateEngine): Int {
+            // Using a CountDownLatch to wait for the status callback
+            val latch = CountDownLatch(1)
+            val statusHolder = AtomicInteger(-1)
+
+            val callback = object : IUpdateEngineCallback.Stub() {
+                override fun onStatusUpdate(status: Int, percentage: Float) {
+                    statusHolder.set(status)
+                    latch.countDown()
+                }
+
+                override fun onPayloadApplicationComplete(errorCode: Int) {
+                    // Not needed for status check
+                }
+            }
+
+            try {
+                updateEngine.bind(callback)
+                // Wait up to 2 seconds for the status - should be nearly instant
+                latch.await(2, TimeUnit.SECONDS)
+                return statusHolder.get()
+            } finally {
+                updateEngine.unbind(callback)
+            }
+        }
+    }
+}

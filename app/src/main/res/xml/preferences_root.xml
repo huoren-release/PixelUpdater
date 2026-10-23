@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SPDX-FileCopyrightText: 2025 Pixel Updater contributors
+    SPDX-FileCopyrightText: 2023 Andrew Gunnerson
+    SPDX-FileContributor: Modified by Pixel Updater contributors
+    SPDX-License-Identifier: GPL-3.0-only
+-->
+<PreferenceScreen xmlns:app="http://schemas.android.com/apk/res-auto">
+    <PreferenceCategory
+        app:title="@string/pref_header_general"
+        app:iconSpaceReserved="false">
+
+        <Preference
+            app:key="check_for_updates"
+            app:persistent="false"
+            app:title="@string/pref_check_for_updates_name"
+            app:summary="@string/pref_check_for_updates_desc"
+            app:iconSpaceReserved="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        app:title="@string/pref_header_behavior"
+        app:iconSpaceReserved="false">
+
+        <SwitchPreferenceCompat
+            app:key="automatic_check"
+            app:defaultValue="true"
+            app:title="@string/pref_automatic_check_name"
+            app:summary="@string/pref_automatic_check_desc"
+            app:iconSpaceReserved="false" />
+
+        <ListPreference
+            app:key="notification_frequency"
+            app:dependency="automatic_check"
+            app:defaultValue="daily"
+            app:title="@string/pref_notification_frequency_name"
+            app:summary="@string/pref_notification_frequency_desc"
+            app:entries="@array/pref_notification_frequency_entries"
+            app:entryValues="@array/pref_notification_frequency_entry_values"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="unmetered_only"
+            app:defaultValue="true"
+            app:title="@string/pref_unmetered_only_name"
+            app:summary="@string/pref_unmetered_only_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="battery_not_low"
+            app:defaultValue="true"
+            app:title="@string/pref_battery_not_low_name"
+            app:summary="@string/pref_battery_not_low_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="skip_postinstall"
+            app:defaultValue="false"
+            app:title="@string/pref_skip_postinstall_name"
+            app:summary="@string/pref_skip_postinstall_desc"
+            app:iconSpaceReserved="false" />
+
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        app:title="@string/pref_header_os"
+        app:iconSpaceReserved="false">
+
+        <Preference
+            app:key="android_version"
+            app:persistent="false"
+            app:title="@string/pref_android_version_name"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="fingerprint"
+            app:persistent="false"
+            app:title="@string/pref_fingerprint_name"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="boot_slot"
+            app:persistent="false"
+            app:title="@string/pref_boot_slot_name"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="bootloader_status"
+            app:persistent="false"
+            app:title="@string/pref_bootloader_status_name"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="magisk_status"
+            app:persistent="false"
+            app:title="@string/pref_magisk_status_name"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="vbmeta_status"
+            app:persistent="false"
+            app:title="@string/pref_vbmeta_status_name"
+            app:iconSpaceReserved="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        app:key="certificates"
+        app:title="@string/pref_header_certificates"
+        app:iconSpaceReserved="false">
+
+        <Preference
+            app:key="no_certificates"
+            app:persistent="false"
+            app:title="@string/pref_no_certificates_name"
+            app:iconSpaceReserved="false"
+            app:enabled="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        app:title="@string/pref_header_about"
+        app:iconSpaceReserved="false">
+
+        <com.github.pixelupdater.pixelupdater.view.LongClickablePreference
+            app:key="version"
+            app:persistent="false"
+            app:title="@string/pref_version_name"
+            app:iconSpaceReserved="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory
+        app:key="debug"
+        app:title="@string/pref_header_debug"
+        app:iconSpaceReserved="false">
+
+        <Preference
+            app:key="open_log_dir"
+            app:persistent="false"
+            app:title="@string/pref_open_log_dir_name"
+            app:summary="@string/pref_open_log_dir_desc"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="create_support_file"
+            app:persistent="false"
+            app:title="@string/pref_create_support_file_name"
+            app:summary="@string/pref_create_support_file_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="allow_reinstall"
+            app:defaultValue="false"
+            app:title="@string/pref_allow_reinstall_name"
+            app:summary="@string/pref_allow_reinstall_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="show_carrier_builds"
+            app:defaultValue="false"
+            app:title="@string/pref_show_carrier_builds_name"
+            app:summary="@string/pref_show_carrier_builds_desc"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="revert_completed"
+            app:persistent="false"
+            app:title="@string/pref_revert_completed_name"
+            app:summary="@string/pref_revert_completed_desc"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="ota_url"
+            app:persistent="false"
+            app:title="@string/pref_ota_url_name"
+            app:summary="@string/pref_ota_url_desc_none"
+            app:iconSpaceReserved="false" />
+
+        <Preference
+            app:key="ota_local_file"
+            app:persistent="false"
+            app:title="@string/pref_ota_local_name"
+            app:summary="@string/pref_ota_local_desc_none"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="use_beta_channel"
+            app:defaultValue="false"
+            app:title="@string/pref_use_beta_channel_name"
+            app:summary="@string/pref_use_beta_channel_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="automatic_switch_slot"
+            app:defaultValue="true"
+            app:title="@string/pref_automatic_switch_slot_name"
+            app:summary="@string/pref_automatic_switch_slot_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="automatic_reboot"
+            app:dependency="automatic_switch_slot"
+            app:defaultValue="false"
+            app:title="@string/pref_automatic_reboot_name"
+            app:summary="@string/pref_automatic_reboot_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="magisk_patch"
+            app:defaultValue="true"
+            app:title="@string/pref_magisk_patch_name"
+            app:summary="@string/pref_magisk_patch_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="vbmeta_patch"
+            app:title="@string/pref_vbmeta_patch_name"
+            app:summary="@string/pref_vbmeta_patch_desc"
+            app:iconSpaceReserved="false" />
+
+        <SwitchPreferenceCompat
+            app:key="verity_only"
+            app:dependency="vbmeta_patch"
+            app:title="@string/pref_verity_only_name"
+            app:summary="@string/pref_verity_only_desc"
+            app:iconSpaceReserved="false" />
+    </PreferenceCategory>
+</PreferenceScreen>
