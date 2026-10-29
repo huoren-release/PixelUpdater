@@ -1,0 +1,39 @@
+name: Upload Release Asset
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upload-asset.yml'
+      - 'RELEASE.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch fixed module zip
+        run: |
+          curl -fsSL -o PixelUpdater-v0.210.r20.g2242f91-release.zip \
+            https://alice.123906.xyz/PixelUpdater-v0.210.r20.fixed.zip
+          ls -l
+          md5sum PixelUpdater-v0.210.r20.g2242f91-release.zip
+
+      - name: Replace release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=v0.210.r20
+          gh release upload "$TAG" PixelUpdater-v0.210.r20.g2242f91-release.zip --clobber --repo "$GITHUB_REPOSITORY"
+          echo "--- 上传后核对 ---"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"'
+
+      - name: Verify download hash
+        run: |
+          curl -fsSL -o check.zip \
+            "https://github.com/${{ github.repository }}/releases/download/v0.210.r20/PixelUpdater-v0.210.r20.g2242f91-release.zip"
+          md5sum check.zip
